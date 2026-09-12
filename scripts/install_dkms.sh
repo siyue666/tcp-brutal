@@ -4,7 +4,7 @@
 # Try `install_dkms.sh --help` for usage.
 #
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2023 Aperture Internet Laboratory
+# Copyright (c) 2023 The Hysteria Project
 #
 
 set -e
@@ -23,7 +23,7 @@ SCRIPT_INITIATOR_URL="https://tcp.hy2.sh"
 SCRIPT_INITIATOR_COMMAND="bash <(curl -fsSL $SCRIPT_INITIATOR_URL)"
 
 # URL of GitHub
-REPO_URL="https://github.com/apernet/tcp-brutal"
+REPO_URL="https://github.com/HyNetworks/tcp-brutal"
 
 # URL of Hysteria 2 API
 HY2_API_BASE_URL="https://api.hy2.io/v1"
@@ -35,6 +35,14 @@ CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 
 DKMS_MODULE_NAME="tcp-brutal"
 KERNEL_MODULE_NAME="brutal"
+
+# The rule management tool, built from the DKMS source tree at install time
+BRUTALCTL_PATH="/usr/local/bin/brutalctl"
+
+# tcp-brutal v2.0.0 and later require this kernel version or later
+V2_MIN_KERNEL_VERSION="5.10"
+# Last version that supports older kernels
+V1_LAST_VERSION="v1.0.3"
 
 
 ###
@@ -63,9 +71,11 @@ mktemp() {
   command mktemp "$@" "/tmp/brutalinst.XXXXXXXXXX"
 }
 
+# Colors are optional: without a terminal (no $TERM, or TERM=dumb) tput fails,
+# which would kill the script under set -e.
 tput() {
-  if has_command tput; then
-    command tput "$@"
+  if has_command tput && [[ -n "$TERM" ]]; then
+    command tput "$@" 2>/dev/null || true
   fi
 }
 
@@ -337,6 +347,37 @@ check_linux_headers() {
   fi
 }
 
+# A clang-built kernel (CONFIG_CC_IS_CLANG) needs clang, lld and llvm to build modules
+is_clang_kernel() {
+  local _build="/lib/modules/$(uname -r)/build"
+  local _config
+
+  for _config in "$_build/include/config/auto.conf" "$_build/.config" "/boot/config-$(uname -r)"; do
+    if [[ -f "$_config" ]]; then
+      if grep -q '^CONFIG_CC_IS_CLANG=y' "$_config"; then
+        return 0
+      fi
+      return 1
+    fi
+  done
+  return 1
+}
+
+check_llvm_toolchain() {
+  if ! is_clang_kernel; then
+    return
+  fi
+  echo -n "Checking LLVM toolchain (kernel built with clang) ... "
+  if has_command clang && has_command ld.lld && has_command llvm-objcopy; then
+    echo "ok"
+    return
+  fi
+  echo "not installed"
+  install_software clang
+  install_software lld
+  install_software llvm
+}
+
 check_environment() {
   check_environment_operating_system
   check_environment_curl
@@ -443,6 +484,26 @@ vercmp() {
   return
 }
 
+kernel_version() {
+  # e.g. 5.10.0-8-amd64 -> 5.10.0
+  uname -r | grep -oE '^[0-9]+\.[0-9]+(\.[0-9]+)?'
+}
+
+check_kernel_version() {
+  local _version="$1"
+
+  if [[ "$(vercmp "$_version" "v2.0.0")" -lt "0" ]]; then
+    return
+  fi
+  if [[ "$(vercmp "$(kernel_version)" "$V2_MIN_KERNEL_VERSION")" -ge "0" ]]; then
+    return
+  fi
+
+  error "tcp-brutal $_version requires Linux $V2_MIN_KERNEL_VERSION or later, but this system is running $(uname -r)."
+  note "Run '$(script_name) --version $V1_LAST_VERSION' to install the last version that supports this kernel."
+  exit 95
+}
+
 
 ###
 # ARGUMENTS PARSER
@@ -454,7 +515,7 @@ show_usage_and_exit() {
   echo
   echo -e "Usage:"
   echo
-  echo -e "${tbold}Install tcp-brutal${treset}"
+  echo -e "${tbold}Install tcp-brutal${treset} (the kernel module, and brutalctl to $BRUTALCTL_PATH)"
   echo -e "\t$(script_name) [install] [ -f | -l <file> | --version <version> ]"
   echo -e "Options:"
   echo -e "\t-f, --force\tForce re-install latest or specified version even if it has been installed."
@@ -592,6 +653,60 @@ dkms_install_tarball() {
   if ! dkms_ldtarball "$_tarball"; then
     error "Failed to install DKMS tarball, please check above output or try to uninstall first."
     return 1
+  fi
+}
+
+# brutalctl is a user-space program and needs the C library headers. Unlike
+# the kernel module, which only needs linux-headers, and unlike the compiler
+# itself, they are not pulled in by dkms (e.g. apt --no-install-recommends).
+install_libc_headers() {
+  local _cc="$1"
+  local _package
+
+  if echo '#include <errno.h>' | "$_cc" -E -x c - >/dev/null 2>&1; then
+    return 0
+  fi
+  if has_command apt; then
+    _package="libc6-dev"
+  elif has_command dnf || has_command yum || has_command zypper; then
+    _package="glibc-devel"
+  else
+    return 1
+  fi
+  echo "Installing missing dependence '$_package' ... "
+  detect_package_manager && $PACKAGE_MANAGEMENT_INSTALL "$_package"
+}
+
+brutalctl_install() {
+  local _version="$(dkms_get_installed_versions "$DKMS_MODULE_NAME" | head -1)"
+  local _source="/usr/src/$DKMS_MODULE_NAME-${_version#v}/tools/brutalctl.c"
+  local _cc
+
+  if [[ ! -f "$_source" ]]; then
+    echo "Installing brutalctl to $BRUTALCTL_PATH ... skipped (not part of $_version)"
+    return
+  fi
+  if has_command cc; then
+    _cc="cc"
+  elif has_command gcc; then
+    _cc="gcc"
+  else
+    echo "Installing brutalctl to $BRUTALCTL_PATH ... skipped (no C compiler)"
+    return
+  fi
+  install_libc_headers "$_cc" || true
+  echo -n "Installing brutalctl to $BRUTALCTL_PATH ... "
+  if "$_cc" -O2 -Wall -o "$BRUTALCTL_PATH" "$_source"; then
+    echo "ok"
+  else
+    warning "Failed to build brutalctl, the kernel module is not affected."
+  fi
+}
+
+brutalctl_uninstall() {
+  if [[ -f "$BRUTALCTL_PATH" ]]; then
+    echo -n "Removing $BRUTALCTL_PATH ... "
+    rm -f "$BRUTALCTL_PATH" && echo "ok"
   fi
 }
 
@@ -776,6 +891,8 @@ perform_install() {
   fi
 
   if [[ -z "$_local_file" && -n "$_version" ]]; then
+    check_kernel_version "$_version"
+
     local _vercmp="$(vercmp "$_installed_version" "$_version")"
     if [[ "$_vercmp" -lt "0" ]]; then
       _install_needed="1"
@@ -798,10 +915,14 @@ perform_install() {
     rm -f "$_local_file"
   fi
 
+  check_llvm_toolchain
+
   echo "Rebuilding DKMS modules as needed ... "
   if ! dkms autoinstall; then
     warning "Error occurred in 'dkms autoinstall', please check above output."
   fi
+
+  brutalctl_install
 
   kmod_setup_autoload "$KERNEL_MODULE_NAME"
 
@@ -843,6 +964,8 @@ perform_uninstall() {
 
   dkms_remove_modules "$DKMS_MODULE_NAME" ""
 
+  brutalctl_uninstall
+
   if ! kmod_unload_if_loaded "$KERNEL_MODULE_NAME"; then
     warning "tcp-brutal is successfully uninstall from your server, but failed to unload from the kernel."
     warning "Please reboot your system to unload it from the kernel."
@@ -865,7 +988,7 @@ perform_check() {
 
   echo -n "Checking kernel module ... "
   if kmod_is_loaded "$KERNEL_MODULE_NAME"; then
-    echo "loaded"
+    echo "loaded, version $(cat "/sys/module/$KERNEL_MODULE_NAME/version" 2> /dev/null || echo unknown)"
   else
     echo "not loaded"
   fi

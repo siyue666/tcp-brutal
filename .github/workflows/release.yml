@@ -16,6 +16,14 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
+      - name: Check that the tag matches the version in brutal.c
+        run: |
+          version=$(./scripts/mkdkmsconf.sh | sed -n 's/^PACKAGE_VERSION="\(.*\)"$/\1/p')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "brutal.c version is $version but the tag is $GITHUB_REF_NAME"
+            exit 1
+          fi
+
       - name: Run build script
         run: |
           make dkms-tarball
@@ -32,3 +40,14 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: build/*
+
+      - name: Publish to API
+        env:
+          HY2_API_POST_KEY: ${{ secrets.HY2_API_POST_KEY }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          code=$(echo "$version" | awk -F. '{ print $1 * 10000 + $2 * 100 + $3 }')
+          curl -fsS -X POST https://api.hy2.io/v1/update \
+            -H "Authorization: $HY2_API_POST_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"code\": $code, \"ver\": \"$GITHUB_REF_NAME\", \"chan\": \"tcp-brutal\", \"url\": \"https://github.com/HyNetworks/tcp-brutal/releases\", \"urgent\": false}"
